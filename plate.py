@@ -49,6 +49,7 @@ from meshmode.dof_array import thaw, flatten, unflatten
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from grudge.eager import EagerDGDiscretization
 from grudge.shortcuts import make_visualizer
+from grudge.op import nodal_max
 
 from mirgecom.profiling import PyOpenCLProfilingArrayContext
 
@@ -58,11 +59,8 @@ from mirgecom.fluid import (
     join_conserved,
     make_conserved
 )
-from mirgecom.artificial_viscosity import (
-    av_operator,
-    smoothness_indicator
-)
 
+from mirgecom.inviscid import get_inviscid_cfl
 from mirgecom.simutil import (
     inviscid_sim_timestep,
     sim_checkpoint,
@@ -88,7 +86,7 @@ from mirgecom.integrators import (
 )
 from mirgecom.steppers import advance_state
 from mirgecom.boundary import (
-    PrescribedViscousBoundary,
+    PrescribedInviscidBoundary,
     IsothermalNoSlipBoundary
 )
 from mirgecom.initializers import (
@@ -222,7 +220,8 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     #nviz = 500
     #nrestart = 500
     nviz = 250
-    nstatus = 10000000000
+    nhealth = 250
+    nstatus = 1
     nrestart = 1000
     #current_dt = 2.5e-8 # stable with euler
     current_dt = 1.0e-7 # stable with rk4
@@ -249,6 +248,10 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
             pass
         try:
             nstatus = int(input_data["nstatus"])
+        except KeyError:
+            pass
+        try:
+            nhealth = int(input_data["nhealth"])
         except KeyError:
             pass
         try:
@@ -353,15 +356,15 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
         #return join_conserved(dim, mass=mass, energy=energy_bc,
                               #momentum=momentum)
 #
-    def pressure_outlet(nodes, eos, q=None, **kwargs):
+    def pressure_outlet(nodes, cv,  normal, **kwargs):
         dim = len(nodes)
      
         p_x = pres_outflow
         ke = 0
         mass = nodes[0] + density - nodes[0]
         momentum = make_obj_array([0*mass for i in range(dim)])
-        if q is not None:
-            cv = split_conserved(dim, q)
+        if cv is not None:
+           # cv = split_conserved(dim, q)
             mass = cv.mass
             momentum = cv.momentum
             ke = .5*np.dot(cv.momentum, cv.momentum)/cv.mass
@@ -369,23 +372,19 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
         return make_conserved(dim, mass=mass, energy=energy_bc,
                               momentum=momentum)
 
-    def symmetry(nodes, eos, q=None, **kwargs):
-        dim = len(nodes)
-        p_x = pres_outflow
-        ke = 0
-        mass = nodes[0] + density - nodes[0]
-        momentum = make_obj_array([0*mass for i in range(dim)])
+    def symmetry(nodes, cv, normal, **kwargs):
 
-        if q is not None:
-            cv = split_conserved(dim, q)
+        if cv is not None:
             mass = cv.mass
             momentum = cv.momentum
             momentum[1] = -1.0 * momentum[1]
             ke = .5*np.dot(cv.momentum, cv.momentum)/cv.mass
             energy = cv.energy
-        energy_bc = p_x / (eos.gamma() - 1) + ke
-        return make_conserved(dim, mass=mass, energy=energy_bc,
+        return make_conserved(dim, mass=mass, energy=energy,
                               momentum=momentum)
+
+    def free(nodes, cv, normal, **kwargs): 
+        return cv
 
     class IsentropicInflow:
 
@@ -458,10 +457,10 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     bulk_init = Uniform(dim=dim, rho=rho_inflow, p=pres_inflow, velocity=vel_inflow)
     outflow_init = pressure_outlet
 
-    inflow = PrescribedViscousBoundary(q_func=inflow_init)
-    outflow = PrescribedViscousBoundary(q_func=outflow_init)
-    bottom_symmetry = PrescribedViscousBoundary(q_func=symmetry)
-    top_free = PrescribedViscousBoundary()
+    inflow = PrescribedInviscidBoundary(fluid_solution_func=inflow_init)
+    outflow = PrescribedInviscidBoundary(fluid_solution_func=outflow_init)
+    bottom_symmetry = PrescribedInviscidBoundary(fluid_solution_func=symmetry)
+    top_free = PrescribedInviscidBoundary(fluid_solution_func = free)
     plate = IsothermalNoSlipBoundary()
 
     boundaries = {DTAG_BOUNDARY("Inflow"): inflow,
@@ -481,10 +480,6 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
         current_step = restart_step
         current_state = restart_data["state"]
 
-        current_state = unflatten(
-            actx, discr.discr_from_dd("vol"),
-            obj_array_vectorize(actx.from_numpy, restart_data["state"]))
-
     timestepper = rk4_step
     #timestepper = euler_step
 
@@ -501,9 +496,17 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
        
         logmgr.add_quantity(log_cfl, interval = nstatus)
 
-        logmgr.add_watches(["step.max", "t_sim.max", "t_step.max", "t_log.max",
-                            "min_pressure", "max_pressure",
-                            "min_temperature", "max_temperature"])
+        logmgr.add_watches([
+            ("step.max", "step = {value}, "),
+            ("t_sim.max", "sim time: {value:1.6e} s, "),
+            ("cfl.max", "cfl = {value:1.4f}\n"),
+            ("min_pressure", "------- P (min, max) (Pa) = ({value:1.9e}, "),
+            ("max_pressure", "{value:1.9e})\n"),
+            ("min_temperature", "------- T (min, max) (K)  = ({value:7g}, "),
+            ("max_temperature", "{value:7g})\n"),
+            ("t_step.max", "------- step walltime: {value:6g} s, "),
+            ("t_log.max", "log walltime: {value:6g} s")
+        ])
 
         try:
             logmgr.add_watches(["memory_usage.max"])
@@ -538,24 +541,44 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     def my_rhs(t, state):
         # check for some troublesome output types
 
-        return (ns_operator(discr, cv= state, t=t,boundaries=boundaries, eos=eos) + make_conserved(dim, q=av_operator(
-                discr, q=state.join(), boundaries=boundaries,
-                boundary_kwargs={"time": t, "eos":eos}, alpha = alpha)
-            ))
+        return (ns_operator(discr, cv= state, t=t,boundaries=boundaries, eos=eos))
 
 
     def my_checkpoint(step, t, dt, state, force = False):
 
+        do_health = force or check_step(step, nhealth) and step > 0
         do_viz = force or check_step(step, nviz)
         do_restart = force or check_step(step, nrestart)
         do_status = force or check_step(step, nstatus)
 
-        if do_viz:
+        if do_viz or do_health:
             dv = eos.dependent_vars(state)
 
+        errors = False
+        if do_health:
+            health_message = ""
+            if check_naninf_local(discr, "vol", dv.pressure):
+                errors = True
+                health_message += "Invalid pressure data found.\n"
+            elif check_range_local(discr,
+                                   "vol",
+                                   dv.pressure,
+                                   min_value=1,
+                                   max_value=2.0e6):
+                errors = True
+                health_message += "Pressure data failed health check.\n"
+
+        errors = comm.allreduce(errors, MPI.LOR)
+        if errors:
+            if rank == 0:
+                logger.info("Fluid solution failed health check.")
+            if health_message:
+                logger.info(f"{rank=}:  {health_message}")
+
         #if check_step(step, nrestart) and step != restart_step and not errors:
-        if do_restart:
-            filename = restart_path+snapshot_pattern.format(step=step, rank=rank, casename=casename)
+        if do_restart or errors:
+            filename = restart_path + snapshot_pattern.format(
+                step=step, rank=rank, casename=casename)
             restart_dictionary = {
                 "local_mesh": local_mesh,
                 "order": order,
@@ -567,12 +590,28 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
             }
             write_restart_file(actx, restart_dictionary, filename, comm)
 
-            viz_fields = [ ("cv", state), 
-                ("dv", eos.dependent_vars(state)),
-            ] 
-         
-            write_visfile(discr, viz_fields, visualizer, vizname=viz_path+casename,
-                          step=step, t=t, overwrite=True, vis_timer=vis_timer)
+        if do_status or do_viz or errors:
+            local_cfl = get_inviscid_cfl(discr, eos=eos, dt=dt, cv=state)
+            max_cfl = nodal_max(discr, "vol", local_cfl)
+            log_cfl.set_quantity(max_cfl)
+
+        #if ((check_step(step, nviz) and step != restart_step) or errors):
+        if do_viz or errors:
+            viz_fields = [("cv", state), ("dv", eos.dependent_vars(state)),
+                        ("cfl", local_cfl)]
+            write_visfile(discr,
+                          viz_fields,
+                          visualizer,
+                          vizname=viz_path + casename,
+                          step=step,
+                          t=t,
+                          overwrite=True,
+                          vis_timer=vis_timer)
+
+        if errors:
+            raise RuntimeError("Error detected by user checkpoint, exiting.")
+
+        return dt
 
 
     if rank == 0:
