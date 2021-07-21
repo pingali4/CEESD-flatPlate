@@ -62,8 +62,7 @@ from mirgecom.fluid import (
 
 from mirgecom.inviscid import get_inviscid_cfl
 from mirgecom.simutil import (
-    inviscid_sim_timestep,
-    sim_checkpoint,
+    get_sim_timestep,
     check_step,
     generate_and_distribute_mesh,
     write_visfile  
@@ -534,7 +533,7 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     if rank == 0:
         logger.info(init_message)
 
-    get_timestep = partial(inviscid_sim_timestep, discr=discr, t=current_t,
+    get_timestep = partial(get_sim_timestep, discr=discr, t=current_t,
                            dt=current_dt, cfl=current_cfl, eos=eos,
                            t_final=t_final, constant_cfl=constant_cfl)
 
@@ -543,8 +542,23 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
 
         return (ns_operator(discr, cv= state, t=t,boundaries=boundaries, eos=eos))
 
+    def my_pre_step(step, t, dt, state):
+        dt = current_dt
+        if logmgr:
+            logmgr.tick_before()
 
-    def my_checkpoint(step, t, dt, state, force = False):
+        my_checkpoint(step, t, dt, state)
+        return state, dt
+
+    def my_post_step(step, t, dt, state):
+        dt = current_dt
+        if logmgr:
+            # set_dt(logmgr, dt)
+            # set_sim_state(logmgr, dim, state, eos)
+            logmgr.tick_after()
+        return state, dt
+
+    def my_checkpoint(step, t, dt, state, force=False):
 
         do_health = force or check_step(step, nhealth) and step > 0
         do_viz = force or check_step(step, nviz)
@@ -619,7 +633,8 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
 
     (current_step, current_t, current_state) = \
         advance_state(rhs=my_rhs, timestepper=timestepper,
-                      checkpoint=my_checkpoint,
+                      pre_step_callback=my_pre_step,
+                      post_step_callback=my_post_step,
                       get_timestep=get_timestep, state=current_state,
                       t_final=t_final, t=current_t, istep=current_step,
                       logmgr=logmgr,eos=eos,dim=dim)
