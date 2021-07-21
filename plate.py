@@ -35,31 +35,45 @@ import numpy.linalg as la  # noqa
 import pyopencl.array as cla  # noqa
 from functools import partial
 import math
+import os
+import yaml
 
 from pytools.obj_array import ( 
     obj_array_vectorize, make_obj_array
 )
 import pickle
 
+from grudge.dof_desc import DTAG_BOUNDARY
 from meshmode.array_context import PyOpenCLArrayContext
 from meshmode.dof_array import thaw, flatten, unflatten
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from grudge.eager import EagerDGDiscretization
 from grudge.shortcuts import make_visualizer
+from grudge.op import nodal_max
 
 from mirgecom.profiling import PyOpenCLProfilingArrayContext
 
 from mirgecom.navierstokes import ns_operator
 from mirgecom.fluid import (
     split_conserved,
-    join_conserved
+    join_conserved,
+    make_conserved
 )
+
+from mirgecom.inviscid import get_inviscid_cfl
 from mirgecom.simutil import (
     inviscid_sim_timestep,
     sim_checkpoint,
     check_step,
-    generate_and_distribute_mesh
+    generate_and_distribute_mesh,
+    write_visfile  
 )
+from mirgecom.restart import (
+    write_restart_file
+)
+
+from mirgecom.restart import(write_restart_file)
+
 from mirgecom.io import make_init_message
 from mirgecom.mpi import mpi_entry_point
 import pyopencl.tools as cl_tools
@@ -72,38 +86,39 @@ from mirgecom.integrators import (
 )
 from mirgecom.steppers import advance_state
 from mirgecom.boundary import (
-    PrescribedViscousBoundary,
+    PrescribedInviscidBoundary,
     IsothermalNoSlipBoundary
 )
 from mirgecom.initializers import (
     PlanarDiscontinuity,
-    Uniform,
+    Uniform
 )
 from mirgecom.eos import IdealSingleGas
 from mirgecom.transport import SimpleTransport
 
-from logpyle import IntervalTimer
+from logpyle import IntervalTimer, LogQuantity
 
 from mirgecom.euler import extract_vars_for_logging, units_for_logging
 from mirgecom.logging_quantities import (initialize_logmgr,
     logmgr_add_many_discretization_quantities, logmgr_add_cl_device_info,
-    logmgr_set_time)
+    logmgr_set_time, LogUserQuantity)
 logger = logging.getLogger(__name__)
 
 
 
 
 @mpi_entry_point
-def main(ctx_factory=cl.create_some_context, 
+def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file = None,  
          snapshot_pattern="{casename}-{step:06d}-{rank:04d}.pkl", restart_step=None, 
-         use_profiling=False, use_logmgr=False, use_lazy_eval=False):
+         restart_name = None, use_profiling=False, use_logmgr=False, use_lazy_eval=False):
 
     from mpi4py import MPI
     comm = MPI.COMM_WORLD
-    rank = 0
     rank = comm.Get_rank()
     nparts = comm.Get_size()
-    casename = "plate"
+
+    if restart_name is None:
+      restart_name=casename
 
     logmgr = initialize_logmgr(use_logmgr, filename=(f"{casename}.sqlite"),
         mode="wo", mpi_comm=comm)
@@ -205,12 +220,64 @@ def main(ctx_factory=cl.create_some_context,
     #nviz = 500
     #nrestart = 500
     nviz = 250
+    nhealth = 250
+    nstatus = 1
     nrestart = 1000
     #current_dt = 2.5e-8 # stable with euler
     current_dt = 1.0e-7 # stable with rk4
     #current_dt = 4e-7 # stable with lrsrk144
     t_final = 1.e-2
     #t_final = 3.e-8
+    integrator = "rk4"
+
+    if user_input_file:
+        if rank ==0:
+            with open(user_input_file) as f:
+                input_data = yaml.load(f, Loader=yaml.FullLoader)
+        else:
+            input_data=None
+        input_data = comm.bcast(input_data, root=0)
+            #print(input_data)
+        try:
+            nviz = int(input_data["nviz"])
+        except KeyError:
+            pass
+        try:
+            nrestart = int(input_data["nrestart"])
+        except KeyError:
+            pass
+        try:
+            nstatus = int(input_data["nstatus"])
+        except KeyError:
+            pass
+        try:
+            nhealth = int(input_data["nhealth"])
+        except KeyError:
+            pass
+        try:
+            current_dt = int(input_data["current_dt"])
+        except KeyError:
+            pass
+        try:
+            t_final = int(input_data["t_final"])
+        except KeyError:
+            pass
+    # param sanity check
+    allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144"]
+    if(integrator not in allowed_integrators):
+        error_message = "Invalid time integrator: {}".format(integrator)
+        raise RuntimeError(error_message)
+
+    if(rank == 0):
+        print(f'#### Simluation control data: ####')
+        print(f'\tnviz = {nviz}')
+        print(f'\tnrestart = {nrestart}')
+        print(f'\tnstatus = {nstatus}')
+        print(f'\tcurrent_dt = {current_dt}')
+        print(f'\tt_final = {t_final}')
+
+    restart_path='restart_data/'
+    viz_path='viz_data/'
 
     dim = 2
     order = 2
@@ -219,7 +286,6 @@ def main(ctx_factory=cl.create_some_context,
     current_cfl = 1.0
     current_t = 0
     constant_cfl = False
-    nstatus = 10000000000
     rank = 0
     checkpoint_t = current_t
     current_step = 0
@@ -246,7 +312,8 @@ def main(ctx_factory=cl.create_some_context,
     # background
     # initial conditions
     vel = np.zeros(shape=(dim,))
-    #kappa = 0.306  # Pr = mu*rho/alpha = 0.75
+    #kappa = 0.306  # Pr = mu*rho/
+    alpha = 0.75
     kappa = 0.  # no heat conduction
     mu = 1.8e-5
     transport_model = SimpleTransport(viscosity=mu, thermal_conductivity=kappa)
@@ -289,34 +356,35 @@ def main(ctx_factory=cl.create_some_context,
         #return join_conserved(dim, mass=mass, energy=energy_bc,
                               #momentum=momentum)
 #
-    def pressure_outlet(nodes, eos, q=None, **kwargs):
+    def pressure_outlet(nodes, cv,  normal, **kwargs):
         dim = len(nodes)
      
         p_x = pres_outflow
         ke = 0
         mass = nodes[0] + density - nodes[0]
         momentum = make_obj_array([0*mass for i in range(dim)])
-        if q is not None:
-            cv = split_conserved(dim, q)
+        if cv is not None:
+           # cv = split_conserved(dim, q)
             mass = cv.mass
             momentum = cv.momentum
             ke = .5*np.dot(cv.momentum, cv.momentum)/cv.mass
         energy_bc = p_x / (eos.gamma() - 1) + ke
-        return join_conserved(dim, mass=mass, energy=energy_bc,
+        return make_conserved(dim, mass=mass, energy=energy_bc,
                               momentum=momentum)
 
-    def symmetry(nodes, eos, q=None, **kwargs):
-        dim = len(nodes)
+    def symmetry(nodes, cv, normal, **kwargs):
 
-        if q is not None:
-            cv = split_conserved(dim, q)
+        if cv is not None:
             mass = cv.mass
             momentum = cv.momentum
             momentum[1] = -1.0 * momentum[1]
             ke = .5*np.dot(cv.momentum, cv.momentum)/cv.mass
             energy = cv.energy
-        return join_conserved(dim, mass=mass, energy=energy,
+        return make_conserved(dim, mass=mass, energy=energy,
                               momentum=momentum)
+
+    def free(nodes, cv, normal, **kwargs): 
+        return cv
 
     class IsentropicInflow:
 
@@ -351,7 +419,7 @@ def main(ctx_factory=cl.create_some_context,
             mass = 0.0*x_vec[0] + rho
             mom = velocity*mass
             energy = (pressure/(gamma - 1.0)) + np.dot(mom, mom)/(2.0*mass)
-            return join_conserved(dim=self._dim, mass=mass, momentum=mom, energy=energy)
+            return make_conserved(dim=self._dim, mass=mass, momentum=mom, energy=energy)
 
     def getIsentropicPressure(mach, P0, gamma):
         pressure=(1.+(gamma-1.)*0.5*math.pow(mach,2))
@@ -371,11 +439,12 @@ def main(ctx_factory=cl.create_some_context,
     velocity = inlet_mach*math.sqrt(gamma*pres_inflow/rho_inflow)
     vel_inflow[0] = velocity
 
-    print(f'inlet Mach number {inlet_mach}')
-    print(f'inlet velocity {velocity}')
-    print(f'inlet temperature {temp_inflow}')
-    print(f'inlet pressure {pres_inflow}')
-    print(f'inlet density {rho_inflow}')
+    if(rank == 0):
+        print(f'inlet Mach number {inlet_mach}')
+        print(f'inlet velocity {velocity}')
+        print(f'inlet temperature {temp_inflow}')
+        print(f'inlet pressure {pres_inflow}')
+        print(f'inlet density {rho_inflow}')
 
     inflow_init = IsentropicInflow(dim=dim, T0=300, P0=101325, mach=inlet_mach)
 
@@ -388,18 +457,17 @@ def main(ctx_factory=cl.create_some_context,
     bulk_init = Uniform(dim=dim, rho=rho_inflow, p=pres_inflow, velocity=vel_inflow)
     outflow_init = pressure_outlet
 
-    inflow = PrescribedViscousBoundary(q_func=inflow_init)
-    outflow = PrescribedViscousBoundary(q_func=outflow_init)
-    bottom_symmetry = PrescribedViscousBoundary(q_func=symmetry)
-    top_free = PrescribedViscousBoundary()
+    inflow = PrescribedInviscidBoundary(fluid_solution_func=inflow_init)
+    outflow = PrescribedInviscidBoundary(fluid_solution_func=outflow_init)
+    bottom_symmetry = PrescribedInviscidBoundary(fluid_solution_func=symmetry)
+    top_free = PrescribedInviscidBoundary(fluid_solution_func = free)
     plate = IsothermalNoSlipBoundary()
 
-    from grudge import sym
-    boundaries = {sym.DTAG_BOUNDARY("Inflow"): inflow,
-                  sym.DTAG_BOUNDARY("Outflow"): outflow,
-                  sym.DTAG_BOUNDARY("Farfield"): top_free,
-                  sym.DTAG_BOUNDARY("PlateUpstream"): bottom_symmetry,
-                  sym.DTAG_BOUNDARY("Plate"): plate}
+    boundaries = {DTAG_BOUNDARY("Inflow"): inflow,
+                  DTAG_BOUNDARY("Outflow"): outflow,
+                  DTAG_BOUNDARY("Farfield"): top_free,
+                  DTAG_BOUNDARY("PlateUpstream"): bottom_symmetry,
+                  DTAG_BOUNDARY("Plate"): plate}
 
     if restart_step is None:
         if rank == 0:
@@ -410,16 +478,14 @@ def main(ctx_factory=cl.create_some_context,
     else:
         current_t = restart_data["t"]
         current_step = restart_step
-
-        current_state = unflatten(
-            actx, discr.discr_from_dd("vol"),
-            obj_array_vectorize(actx.from_numpy, restart_data["state"]))
+        current_state = restart_data["state"]
 
     timestepper = rk4_step
     #timestepper = euler_step
 
 
     vis_timer = None
+    log_cfl = LogUserQuantity(name="cfl", value=current_cfl)
 
     if logmgr:
         logmgr_add_cl_device_info(logmgr, queue)
@@ -427,10 +493,20 @@ def main(ctx_factory=cl.create_some_context,
             extract_vars_for_logging, units_for_logging)
         logmgr_set_time(logmgr, current_step, current_t)
         #logmgr_add_package_versions(logmgr)
+       
+        logmgr.add_quantity(log_cfl, interval = nstatus)
 
-        logmgr.add_watches(["step.max", "t_sim.max", "t_step.max", "t_log.max",
-                            "min_pressure", "max_pressure",
-                            "min_temperature", "max_temperature"])
+        logmgr.add_watches([
+            ("step.max", "step = {value}, "),
+            ("t_sim.max", "sim time: {value:1.6e} s, "),
+            ("cfl.max", "cfl = {value:1.4f}\n"),
+            ("min_pressure", "------- P (min, max) (Pa) = ({value:1.9e}, "),
+            ("max_pressure", "{value:1.9e})\n"),
+            ("min_temperature", "------- T (min, max) (K)  = ({value:7g}, "),
+            ("max_temperature", "{value:7g})\n"),
+            ("t_step.max", "------- step walltime: {value:6g} s, "),
+            ("t_log.max", "log walltime: {value:6g} s")
+        ])
 
         try:
             logmgr.add_watches(["memory_usage.max"])
@@ -464,43 +540,79 @@ def main(ctx_factory=cl.create_some_context,
 
     def my_rhs(t, state):
         # check for some troublesome output types
-        inf_exists = not np.isfinite(discr.norm(state, np.inf))
-        if inf_exists:
+
+        return (ns_operator(discr, cv= state, t=t,boundaries=boundaries, eos=eos))
+
+
+    def my_checkpoint(step, t, dt, state, force = False):
+
+        do_health = force or check_step(step, nhealth) and step > 0
+        do_viz = force or check_step(step, nviz)
+        do_restart = force or check_step(step, nrestart)
+        do_status = force or check_step(step, nstatus)
+
+        if do_viz or do_health:
+            dv = eos.dependent_vars(state)
+
+        errors = False
+        if do_health:
+            health_message = ""
+            if check_naninf_local(discr, "vol", dv.pressure):
+                errors = True
+                health_message += "Invalid pressure data found.\n"
+            elif check_range_local(discr,
+                                   "vol",
+                                   dv.pressure,
+                                   min_value=1,
+                                   max_value=2.0e6):
+                errors = True
+                health_message += "Pressure data failed health check.\n"
+
+        errors = comm.allreduce(errors, MPI.LOR)
+        if errors:
             if rank == 0:
-                logging.info("Non-finite values detected in simulation, exiting...")
-            # dump right now
-            sim_checkpoint(discr=discr, visualizer=visualizer, eos=eos,
-                              q=state, vizname=casename,
-                              step=999999999, t=t, dt=current_dt,
-                              nviz=1, exittol=exittol,
-                              constant_cfl=constant_cfl, comm=comm, vis_timer=vis_timer,
-                              overwrite=True)
-            exit()
+                logger.info("Fluid solution failed health check.")
+            if health_message:
+                logger.info(f"{rank=}:  {health_message}")
 
-        return (ns_operator(discr, q=state, t=t,boundaries=boundaries, eos=eos))
+        #if check_step(step, nrestart) and step != restart_step and not errors:
+        if do_restart or errors:
+            filename = restart_path + snapshot_pattern.format(
+                step=step, rank=rank, casename=casename)
+            restart_dictionary = {
+                "local_mesh": local_mesh,
+                "order": order,
+                "state": state,
+                "t": t,
+                "step": step,
+                "global_nelements": global_nelements,
+                "num_parts": nparts
+            }
+            write_restart_file(actx, restart_dictionary, filename, comm)
 
+        if do_status or do_viz or errors:
+            local_cfl = get_inviscid_cfl(discr, eos=eos, dt=dt, cv=state)
+            max_cfl = nodal_max(discr, "vol", local_cfl)
+            log_cfl.set_quantity(max_cfl)
 
-    def my_checkpoint(step, t, dt, state):
+        #if ((check_step(step, nviz) and step != restart_step) or errors):
+        if do_viz or errors:
+            viz_fields = [("cv", state), ("dv", eos.dependent_vars(state)),
+                        ("cfl", local_cfl)]
+            write_visfile(discr,
+                          viz_fields,
+                          visualizer,
+                          vizname=viz_path + casename,
+                          step=step,
+                          t=t,
+                          overwrite=True,
+                          vis_timer=vis_timer)
 
-        write_restart = (check_step(step, nrestart)
-                         if step != restart_step else False)
-        if write_restart is True:
-            with open(snapshot_pattern.format(casename=casename, step=step, rank=rank), "wb") as f:
-                pickle.dump({
-                    "local_mesh": local_mesh,
-                    "state": obj_array_vectorize(actx.to_numpy, flatten(state)),
-                    "t": t,
-                    "step": step,
-                    "global_nelements": global_nelements,
-                    "num_parts": nparts,
-                    }, f)
+        if errors:
+            raise RuntimeError("Error detected by user checkpoint, exiting.")
 
-        return sim_checkpoint(discr=discr, visualizer=visualizer, eos=eos,
-                              q=state, vizname=casename,
-                              step=step, t=t, dt=dt, nstatus=nstatus,
-                              nviz=nviz, exittol=exittol,
-                              constant_cfl=constant_cfl, comm=comm, vis_timer=vis_timer,
-                              overwrite=True)
+        return dt
+
 
     if rank == 0:
         logging.info("Stepping.")
@@ -517,7 +629,7 @@ def main(ctx_factory=cl.create_some_context,
 
     my_checkpoint(current_step, t=current_t,
                   dt=(current_t - checkpoint_t),
-                  state=current_state)
+                  state=current_state, force = True)
 
     if current_t - t_final < 0:
         raise ValueError("Simulation exited abnormally")
@@ -543,6 +655,12 @@ if __name__ == "__main__":
     parser.add_argument('-r', '--restart_file',  type=ascii, 
                         dest='restart_file', nargs='?', action='store', 
                         help='simulation restart file')
+    parser.add_argument('-i', '--input_file',  type=ascii,
+                        dest='input_file', nargs='?', action='store',
+                        help='simulation config file')
+    parser.add_argument('-c', '--casename',  type=ascii,
+                        dest='casename', nargs='?', action='store',
+                        help='simulation case name')
     parser.add_argument("--profile", action="store_true", default=False,
         help="enable kernel profiling [OFF]")
     parser.add_argument("--log", action="store_true", default=True,
@@ -552,6 +670,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+ # for writing output
+    casename = "plate"
+    if(args.casename):
+        print(f"Custom casename {args.casename}")
+        casename = (args.casename).replace("'","")
+    else:
+        print(f"Default casename {casename}")
+
     snapshot_pattern="{casename}-{step:06d}-{rank:04d}.pkl"
     restart_step=None
     if(args.restart_file):
@@ -560,7 +686,12 @@ if __name__ == "__main__":
         #print(f"step {restart_step}")
     #print(f"step {restart_step}")
     
-
+    input_file=None
+    if(args.input_file):
+        input_file = (args.input_file).replace("'","")
+        print(f"Reading user input from {args.input_file}")
+    else:
+        print("No user input file, using default values")
     print(f"Running {sys.argv[0]}\n")
     main(restart_step=restart_step, snapshot_pattern=snapshot_pattern,
          use_profiling=args.profile, use_lazy_eval=args.lazy, use_logmgr=args.log)
