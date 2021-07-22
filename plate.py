@@ -312,8 +312,7 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     # background
     # initial conditions
     vel = np.zeros(shape=(dim,))
-    #kappa = 0.306  # Pr = mu*rho/
-    alpha = 0.75
+    #kappa = 0.306  # Pr = mu*rho/ alpha = 0.75
     kappa = 0.  # no heat conduction
     mu = 1.8e-5
     transport_model = SimpleTransport(viscosity=mu, thermal_conductivity=kappa)
