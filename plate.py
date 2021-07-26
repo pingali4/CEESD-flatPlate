@@ -41,10 +41,13 @@ import yaml
 from pytools.obj_array import ( 
     obj_array_vectorize, make_obj_array
 )
-#import pickle
+import pickle
 
 from grudge.dof_desc import DTAG_BOUNDARY
-from meshmode.array_context import PyOpenCLArrayContext
+from meshmode.array_context import (
+    PyOpenCLArrayContext,
+    PytatoPyOpenCLArrayContext
+)
 from meshmode.dof_array import thaw, flatten, unflatten
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from grudge.eager import EagerDGDiscretization
@@ -64,13 +67,13 @@ from mirgecom.fluid import (
 from mirgecom.simutil import (
     generate_and_distribute_mesh,
     get_sim_timestep,
+    check_naninf_local,
+    check_range_local,
     check_step,
     generate_and_distribute_mesh,
-    write_visfile  
+    write_visfile 
 )
-from mirgecom.restart import (
-    write_restart_file
-)
+from mirgecom.restart import write_restart_file
 
 
 from mirgecom.io import make_init_message
@@ -95,20 +98,15 @@ from mirgecom.initializers import (
 from mirgecom.eos import IdealSingleGas
 from mirgecom.transport import SimpleTransport
 
-from logpyle import IntervalTimer, set_dt
+
+from logpyle import IntervalTimer, LogQuantity, set_dt
+
 
 from mirgecom.euler import extract_vars_for_logging, units_for_logging
 from mirgecom.logging_quantities import (initialize_logmgr,
     logmgr_add_many_discretization_quantities, logmgr_add_cl_device_info,
     logmgr_set_time, LogUserQuantity, set_sim_state)
 logger = logging.getLogger(__name__)
-
-
-class MyRuntimeError(RuntimeError):
-    """Simple exception to kill the simulation."""
-
-    pass
-
 
 @mpi_entry_point
 def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file = None, restart_file=None,use_profiling=False, use_logmgr=False, use_lazy_eval=False):
@@ -118,6 +116,9 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     rank = comm.Get_rank()
     nparts = comm.Get_size()
 
+
+    if restart_name is None:
+        restart_name=casename
 
     logmgr = initialize_logmgr(use_logmgr, filename=(f"{casename}.sqlite"),
         mode="wo", mpi_comm=comm)
@@ -134,7 +135,6 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     else:
         queue = cl.CommandQueue(cl_ctx)
         if use_lazy_eval:
-            from meshmode.array_context import PytatoPyOpenCLArrayContext
             actx = PytatoPyOpenCLArrayContext(queue)
         else:
             actx = PyOpenCLArrayContext(queue,
@@ -150,18 +150,18 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
 
     def get_mesh():
         """Generate or import a grid using `gmsh`.
-    
+
         Input required:
             data/flat_plate.msh   (read existing mesh)
-    
+
         """
         from meshmode.mesh.io import (
             generate_gmsh,
             ScriptSource
         )
-    
-        # for 2D, the line segments/surfaces need to be specified clockwise to get the correct
-        # facing (right-handed) surface normals
+
+        # for 2D, the line segments/surfaces need to be specified clockwise to
+        # get the correct facing (right-handed) surface normals
         my_string = (f"""
                 size_plate=0.001;
                 size_bottom=0.02;
@@ -210,11 +210,14 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
       #  with open(snapshot_pattern.format(casename=casename, step=restart_step, rank=rank), "rb") as f:
        #     restart_data = pickle.load(f)
 
-        #local_mesh = restart_data["local_mesh"]
-        #local_nelements = local_mesh.nelements
-        #global_nelements = restart_data["global_nelements"]
+        local_mesh = restart_data["local_mesh"]
+        local_nelements = local_mesh.nelements
+        global_nelements = restart_data["global_nelements"]
+        current_step = restart_data["step"]
+        current_t = restart_data["t"]
+        restart_order = int(restart_data["order"])
 
-        #assert comm.Get_size() == restart_data["num_parts"]
+        assert comm.Get_size() == restart_data["num_parts"]
 
 
     #nviz = 500
@@ -229,6 +232,7 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     t_final = 1.e-2
     #t_final = 3.e-8
     integrator = "rk4"
+    order = 1
 
     if user_input_file:
         if rank ==0:
@@ -255,13 +259,22 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
         except KeyError:
             pass
         try:
-            current_dt = int(input_data["current_dt"])
+            current_dt = float(input_data["current_dt"])
         except KeyError:
             pass
         try:
-            t_final = int(input_data["t_final"])
+            t_final = float(input_data["t_final"])
         except KeyError:
             pass
+        try:
+            order = int(input_data["order"])
+        except KeyError:
+            pass
+        try:
+            integrator = input_data["integrator"]
+        except KeyError:
+            pass
+
     # param sanity check
     allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144"]
     if(integrator not in allowed_integrators):
@@ -275,13 +288,14 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
         print(f'\tnstatus = {nstatus}')
         print(f'\tcurrent_dt = {current_dt}')
         print(f'\tt_final = {t_final}')
+        print(f"\torder = {order}")
+        print(f"\tTime integration {integrator}")
+        print("#### Simluation control data: ####")
 
     restart_path='restart_data/'
     viz_path='viz_data/'
 
     dim = 2
-    order = 2
-    exittol = .09
     #t_final = 0.001
     current_cfl = 1.0
     current_t = 0
@@ -291,7 +305,6 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     current_step = 0
 
     vel_inflow = np.zeros(shape=(dim,))
-    vel_outflow = np.zeros(shape=(dim,))
 
     # working gas: air #
     #   gamma = 1.289
@@ -543,7 +556,8 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
         vis_timer = IntervalTimer("t_vis", "Time spent visualizing")
         logmgr.add_quantity(vis_timer)
 
-    visualizer = make_visualizer(discr)
+
+    visualizer = make_visualizer(discr, order)
     initname = "plate"
     eosname = eos.__class__.__name__
     init_message = make_init_message(dim=dim, order=order,
@@ -557,10 +571,6 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
                                      eosname=eosname, casename=casename)
     if rank == 0:
         logger.info(init_message)
-
-    #get_timestep = partial(get_sim_timestep, discr=discr, t=current_t,
-                   #        dt=current_dt, cfl=current_cfl, eos=eos,
-                    #       t_final=t_final, constant_cfl=constant_cfl)
 
     def my_rhs(t, state):
         # check for some troublesome output types
@@ -624,29 +634,35 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
             from grudge.op import nodal_max
             cfl = nodal_max(discr, "vol", ts_field)
 
+    def my_get_timestep(t, dt, state):
+        t_remaining = max(0, t_final - t)
+        if constant_cfl:
+            from mirgecom.viscous import get_viscous_timestep
+            ts_field = current_cfl * get_viscous_timestep(discr, eos=eos, cv=state)
+            from grudge.op import nodal_min
+            dt = nodal_min(discr, "vol", ts_field)
+            cfl = current_cfl
+        else:
+            from mirgecom.viscous import get_viscous_cfl
+            ts_field = get_viscous_cfl(discr, eos=eos, dt=dt, cv=state)
+            from grudge.op import nodal_max
+            cfl = nodal_max(discr, "vol", ts_field)
+
         return ts_field, cfl, min(t_remaining, dt)
 
     def my_pre_step(step, t, dt, state):
-       try:
-          dv = None
-       	  dt = current_dt
-          if logmgr:
-              	logmgr.tick_before()
-          #dt = get_sim_timestep(discr, state, t, dt, current_cfl, eos,
-           #                       t_final, constant_cfl)
+        dt = current_dt
+        if logmgr:
+            logmgr.tick_before()
 
-          my_checkpoint(step, t, dt, state)
-       except MyRuntimeError:
-          if rank == 0:
-                logger.info("Errors detected; attempting graceful exit.")
-          my_write_viz(step=step, t=t, dt=dt, state=state)
-          my_write_restart(step=step, t=t, state=state)
-          raise
-       return state, dt
+        ts_field, cfl, dt = my_get_timestep(t, dt, state)
+        log_cfl.set_quantity(cfl)
+
+        my_checkpoint(step, t, dt, state)
+        return state, dt
 
     def my_post_step(step, t, dt, state):
-       # dt = current_dt
-       if logmgr:
+        if logmgr:
             set_dt(logmgr, dt)
             set_sim_state(logmgr, dim, state, eos)
             logmgr.tick_after()
@@ -677,7 +693,6 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
                     dv = eos.dependent_vars(state)
             my_write_viz(step=step, t=t, dt=dt, state=state, dv=dv)
 
-
     if rank == 0:
         logging.info("Stepping.")
     current_dt = get_sim_timestep(discr, current_state, current_t, current_dt,
@@ -686,7 +701,8 @@ def main(ctx_factory=cl.create_some_context, casename = "plate", user_input_file
     (current_step, current_t, current_state) = \
         advance_state(rhs=my_rhs, timestepper=timestepper,
                       pre_step_callback=my_pre_step,
-                      post_step_callback=my_post_step, state=current_state,
+                      post_step_callback=my_post_step,
+                      state=current_state, dt=current_dt,
                       t_final=t_final, t=current_t, istep=current_step)
 
     if rank == 0:
@@ -763,10 +779,11 @@ if __name__ == "__main__":
     input_file=None
     if(args.input_file):
         input_file = (args.input_file).replace("'","")
-        print(f"Reading user input from {args.input_file}")
+        print(f"Reading user input from {input_file}")
     else:
         print("No user input file, using default values")
     print(f"Running {sys.argv[0]}\n")
+    
     #main(restart_step=restart_step, snapshot_pattern=snapshot_pattern,
      #    use_profiling=args.profile, use_lazy_eval=args.lazy, use_logmgr=args.log)
     main(restart_file=restart_file,
